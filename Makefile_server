@@ -1,0 +1,161 @@
+.PHONY: update upgrade install-deps install-ufw ufw-enable ufw-allow-ssh ufw-status install-git install-ocserv install-ocserv-deps setup \
+	install-meson build-ocserv install-ocserv-service \
+	install-certbot certbot-standalone certbot-nginx certbot-apache certbot-webroot certbot-check certbot-dry-run \
+	configure-ocserv start-ocserv enable-ocserv ocserv-status create-vpn-user \
+	enable-ip-forward configure-masquerade \
+	install-oc-client connect-vpn create-client-services start-client-services
+
+OCSERV_DIR = /tmp/ocserv
+SCRIPTS_DIR = $(dir $(abspath $(lastword $(MAKEFILE_LIST))))scripts
+EMAIL ?= name@example.com
+DOMAIN ?= vpn.example.com
+TCP_PORT ?= 443
+IFACE ?=
+VPN_USER ?= vpnuser
+
+update:
+	sudo apt update
+
+upgrade:
+	sudo apt upgrade -y
+
+install-deps:
+	sudo apt install wget curl nano software-properties-common dirmngr apt-transport-https gnupg2 ca-certificates lsb-release unzip -y
+
+install-ufw:
+	sudo apt install ufw -y
+
+ufw-allow-ssh:
+	sudo ufw allow 22/tcp
+
+ufw-enable:
+	echo "y" | sudo ufw enable
+
+ufw-status:
+	sudo ufw status
+
+install-git:
+	sudo apt install git -y
+
+install-ocserv:
+	sudo apt install ocserv -y
+
+install-ocserv-deps:
+	sudo apt install -y libgnutls28-dev libev-dev libpam0g-dev liblz4-dev libseccomp-dev \
+		libreadline-dev libnl-route-3-dev libkrb5-dev libradcli-dev \
+		libcurl4-gnutls-dev libcjose-dev libjansson-dev libprotobuf-c-dev \
+		libtalloc-dev libhttp-parser-dev protobuf-c-compiler gperf \
+		nuttcp lcov libuid-wrapper libpam-wrapper libnss-wrapper \
+		libsocket-wrapper gss-ntlmssp haproxy iputils-ping freeradius \
+		gawk gnutls-bin iproute2 yajl-tools tcpdump autoconf automake \
+		ipcalc libtasn1-6-dev libtasn1-bin
+
+# --- Build ocserv from source (Meson) ---
+
+install-meson:
+	sudo apt install -y meson ninja-build
+
+build-ocserv:
+	git clone https://gitlab.com/openconnect/ocserv.git $(OCSERV_DIR) || true
+	cd $(OCSERV_DIR) && meson setup builddir
+	cd $(OCSERV_DIR) && meson compile -C builddir
+	cd $(OCSERV_DIR) && sudo meson install -C builddir
+
+install-ocserv-service:
+	sudo cp $(OCSERV_DIR)/doc/systemd/standalone/ocserv.service /etc/systemd/system/ocserv.service
+	sudo sed -i 's|ExecStart=/usr/sbin/ocserv|ExecStart=/usr/local/sbin/ocserv|g' /etc/systemd/system/ocserv.service
+	pidof systemd > /dev/null 2>&1 && sudo systemctl daemon-reload || echo "==> systemd not running, skipping daemon-reload"
+
+# --- SSL Certificates with Certbot ---
+
+install-certbot:
+	sudo apt install -y python3-pip python3-venv
+	sudo python3 -m venv /opt/certbot
+	sudo /opt/certbot/bin/pip install --upgrade pip
+	sudo /opt/certbot/bin/pip install certbot
+	sudo ln -sf /opt/certbot/bin/certbot /usr/bin/certbot
+
+certbot-standalone:
+	sudo certbot certonly --standalone --agree-tos --no-eff-email --staple-ocsp --preferred-challenges http -m $(EMAIL) -d $(DOMAIN)
+
+certbot-nginx:
+	sudo certbot certonly --nginx --agree-tos --no-eff-email --staple-ocsp --preferred-challenges http -m $(EMAIL) -d $(DOMAIN)
+
+certbot-apache:
+	sudo certbot certonly --apache --agree-tos --no-eff-email --staple-ocsp --preferred-challenges http -m $(EMAIL) -d $(DOMAIN)
+
+certbot-webroot:
+	sudo mkdir -p /var/www/ocserv
+	sudo chown www-data:www-data /var/www/ocserv -R
+	sudo certbot certonly --webroot --agree-tos --no-eff-email --staple-ocsp --preferred-challenges http -m $(EMAIL) -d $(DOMAIN)
+
+certbot-check:
+	sudo systemctl list-timers | grep certbot
+
+certbot-dry-run:
+	sudo certbot renew --dry-run
+
+# --- Step 5: Configure OpenConnect ---
+
+configure-ocserv:
+	chmod +x $(SCRIPTS_DIR)/configure-ocserv.sh
+	OCSERV_DIR=$(OCSERV_DIR) $(SCRIPTS_DIR)/configure-ocserv.sh $(DOMAIN) $(TCP_PORT)
+
+# --- Step 6: Start OpenConnect Server ---
+
+enable-ocserv:
+	sudo systemctl enable ocserv
+
+start-ocserv:
+	sudo systemctl start ocserv
+
+ocserv-status:
+	sudo systemctl status ocserv
+
+# --- Step 7: Create VPN User ---
+
+create-vpn-user:
+	sudo ocpasswd -c /etc/ocserv/ocpasswd $(VPN_USER)
+
+# --- Step 8: Enable IP Forwarding + TCP BBR ---
+
+enable-ip-forward:
+	echo "net.ipv4.ip_forward = 1" | sudo tee /etc/sysctl.d/60-custom.conf
+	echo "net.core.default_qdisc=fq" | sudo tee -a /etc/sysctl.d/60-custom.conf
+	echo "net.ipv4.tcp_congestion_control=bbr" | sudo tee -a /etc/sysctl.d/60-custom.conf
+	sudo sysctl -p /etc/sysctl.d/60-custom.conf
+
+# --- Step 9: IP Masquerading ---
+
+configure-masquerade:
+	chmod +x $(SCRIPTS_DIR)/configure-ufw-masquerade.sh
+	$(SCRIPTS_DIR)/configure-ufw-masquerade.sh $(IFACE)
+
+# --- Step 10: OpenConnect Client ---
+
+install-oc-client:
+	sudo apt install openconnect -y
+
+connect-vpn:
+	sudo openconnect -b $(DOMAIN):$(TCP_PORT)
+
+create-client-services:
+	chmod +x $(SCRIPTS_DIR)/create-client-services.sh
+	@echo "Usage: make create-client-services DOMAIN=vpn.example.com VPN_USER=user VPN_PASS=pass"
+	$(SCRIPTS_DIR)/create-client-services.sh $(DOMAIN) $(VPN_USER) $(VPN_PASS)
+
+start-client-services:
+	sudo systemctl start openconnect
+	sudo systemctl start openconnect-check
+
+# --- Full Setup (Server Side) ---
+
+setup: update upgrade install-deps install-ufw ufw-allow-ssh ufw-enable ufw-status install-git install-ocserv-deps install-meson build-ocserv install-ocserv-service install-certbot
+	@echo "==> Base install complete."
+	@echo "==> Next steps (run manually):"
+	@echo "  1. make certbot-standalone EMAIL=you@example.com DOMAIN=vpn.example.com"
+	@echo "  2. make configure-ocserv DOMAIN=vpn.example.com"
+	@echo "  3. make enable-ocserv start-ocserv"
+	@echo "  4. make create-vpn-user VPN_USER=myuser"
+	@echo "  5. make enable-ip-forward"
+	@echo "  6. make configure-masquerade"
